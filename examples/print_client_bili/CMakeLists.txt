@@ -4,7 +4,7 @@ file (GLOB HEADER_FILES *.hpp)
 
 set(CMAKE_CXX_FLAGS "-std=c++14")
 
-link_libraries(z ws2_32)
+link_libraries(z ws2_32 mbedtls mbedcrypto mbedx509)
 
 init_target (print_client_bili)
 

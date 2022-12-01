@@ -9,6 +9,13 @@
 #define WILIWILI_LIVE_CHAT_API_H
 
 #include <thread>
+// ------- mbedtls ---------
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/debug.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/error.h>
 
 #define ASIO_STANDALONE
 
@@ -17,7 +24,59 @@
 namespace websocketpp {
 
     namespace transport {
+        /// Stub transport policy that has no input or output.
         namespace test {
+
+            /// stub transport errors
+            namespace error {
+                enum value {
+                    /// Catch-all error for transport policy errors that don't fit in other
+                    /// categories
+                    success = 0,
+                    general,
+                    mbedtls_ctr_drbg_seed_fail,
+
+                    /// not implemented
+                    not_implemented
+                };
+
+                /// stub transport error category
+                class category : public lib::error_category {
+                public:
+                    category() {}
+
+                    char const * name() const _WEBSOCKETPP_NOEXCEPT_TOKEN_ {
+                        return "websocketpp.transport.mbedtls";
+                    }
+
+                    std::string message(int value) const {
+                        switch(value) {
+                            case success:
+                                return "success";
+                            case general:
+                                return "Generic stub transport policy error";
+                            case mbedtls_ctr_drbg_seed_fail:
+                                return "mbedtls_ctr_drbg_seed_fail";
+                            case not_implemented:
+                                return "feature not implemented";
+                            default:
+                                return "Unknown";
+                        }
+                    }
+                };
+
+                /// Get a reference to a static copy of the stub transport error category
+                inline lib::error_category const & get_category() {
+                    static category instance;
+                    return instance;
+                }
+
+                /// Get an error code with the given value and the stub transport category
+                inline lib::error_code make_error_code(error::value e) {
+                    return lib::error_code(static_cast<int>(e), get_category());
+                }
+
+            } // namespace error
 
             struct socket {
 
@@ -49,6 +108,49 @@ namespace websocketpp {
 
                 void init(init_handler handler) {
                     std::cout << "init" << " " << __LINE__ << std::endl;
+                    mbedtls_debug_set_threshold( 0 );
+                    mbedtls_net_init( &m_server_fd );
+                    mbedtls_ssl_init( &m_ssl );
+                    mbedtls_ssl_config_init( &m_conf );
+                    mbedtls_x509_crt_init( &m_cacert );
+                    mbedtls_ctr_drbg_init( &m_ctr_drbg );
+
+                    std::cout <<  "Seeding the random number generator... " << __LINE__ << std::endl;
+
+                    mbedtls_entropy_init( &m_entropy );
+                    int ret = 0;
+                    if( ( ret = mbedtls_ctr_drbg_seed( &m_ctr_drbg, mbedtls_entropy_func, &m_entropy,
+                                                       (const unsigned char *) pers,
+                                                       strlen( pers ) ) ) != 0 )
+                    {
+                        std::cout <<  " failed  ! mbedtls_ctr_drbg_seed returned " << ret  << " " << __LINE__ << std::endl;
+                        return handler(error::make_error_code(error::value::mbedtls_ctr_drbg_seed_fail));
+                    }
+                    std::cout << "init " << __LINE__ << std::endl;
+                    handler(error::make_error_code(error::value::success));
+                }
+
+                lib::error_code init_mbedtls() {
+                    mbedtls_debug_set_threshold( 0 );
+                    mbedtls_net_init( &m_server_fd );
+                    mbedtls_ssl_init( &m_ssl );
+                    mbedtls_ssl_config_init( &m_conf );
+                    mbedtls_x509_crt_init( &m_cacert );
+                    mbedtls_ctr_drbg_init( &m_ctr_drbg );
+
+                    std::cout <<  "Seeding the random number generator... " << __LINE__ << std::endl;
+
+                    mbedtls_entropy_init( &m_entropy );
+                    int ret = 0;
+                    if( ( ret = mbedtls_ctr_drbg_seed( &m_ctr_drbg, mbedtls_entropy_func, &m_entropy,
+                                                       (const unsigned char *) pers,
+                                                       strlen( pers ) ) ) != 0 )
+                    {
+                        std::cout <<  " failed  ! mbedtls_ctr_drbg_seed returned " << ret  << " " << __LINE__ << std::endl;
+                        return error::make_error_code(error::value::mbedtls_ctr_drbg_seed_fail);
+                    }
+                    std::cout << "init " << __LINE__ << std::endl;
+                    return error::make_error_code(error::value::success);
                 }
 
                 void async_read_at_least(size_t num_bytes, char *buf, size_t len,
@@ -106,6 +208,18 @@ namespace websocketpp {
                 lib::shared_ptr<elog_type> m_elog;
 
                 connection_hdl m_connection_hdl;
+
+                mbedtls_net_context m_server_fd;
+                uint32_t m_flags;
+                unsigned char m_buf[1024];
+                const char *pers = "ssl_client1";
+
+                mbedtls_entropy_context m_entropy;
+                mbedtls_ctr_drbg_context m_ctr_drbg;
+                mbedtls_ssl_context m_ssl;
+                mbedtls_ssl_config m_conf;
+                mbedtls_x509_crt m_cacert;
+
             };
 
             template<typename config>
