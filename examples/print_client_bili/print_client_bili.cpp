@@ -9,6 +9,7 @@
 #define WILIWILI_LIVE_CHAT_API_H
 
 #include <thread>
+#include <exception>
 // ------- mbedtls ---------
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/debug.h>
@@ -20,6 +21,9 @@
 #define ASIO_STANDALONE
 
 #include <websocketpp/config/core_client.hpp>
+#include <mbedtls/platform.h>
+
+#include "threading.h"
 
 namespace websocketpp {
 
@@ -35,6 +39,10 @@ namespace websocketpp {
                     success = 0,
                     general,
                     mbedtls_ctr_drbg_seed_fail,
+                    connect_fail,
+                    async_write_fail,
+                    async_read_fail,
+                    connect_close,
 
                     /// not implemented
                     not_implemented
@@ -45,18 +53,26 @@ namespace websocketpp {
                 public:
                     category() {}
 
-                    char const * name() const _WEBSOCKETPP_NOEXCEPT_TOKEN_ {
+                    char const *name() const _WEBSOCKETPP_NOEXCEPT_TOKEN_ {
                         return "websocketpp.transport.mbedtls";
                     }
 
                     std::string message(int value) const {
-                        switch(value) {
+                        switch (value) {
                             case success:
                                 return "success";
                             case general:
                                 return "Generic stub transport policy error";
                             case mbedtls_ctr_drbg_seed_fail:
                                 return "mbedtls_ctr_drbg_seed_fail";
+                            case connect_fail:
+                                return "connection fail";
+                            case async_write_fail:
+                                return "aysnc_write fail";
+                            case async_read_fail:
+                                return "aysnc_read fail";
+                            case connect_close:
+                                return "connect close";
                             case not_implemented:
                                 return "feature not implemented";
                             default:
@@ -66,7 +82,7 @@ namespace websocketpp {
                 };
 
                 /// Get a reference to a static copy of the stub transport error category
-                inline lib::error_category const & get_category() {
+                inline lib::error_category const &get_category() {
                     static category instance;
                     return instance;
                 }
@@ -101,72 +117,251 @@ namespace websocketpp {
 
                 explicit connection(bool is_server, const lib::shared_ptr<alog_type> &alog,
                                     const lib::shared_ptr<elog_type> &elog) : m_is_server(is_server), m_alog(alog),
-                                                                              m_elog(elog) {
+                                                                              m_elog(elog), th(std::make_shared<Threading>()) {
                     std::cout << "connection" << " " << __LINE__ << std::endl;
                     m_alog->write(log::alevel::devel, "iostream con transport constructor");
                 }
 
                 void init(init_handler handler) {
                     std::cout << "init" << " " << __LINE__ << std::endl;
-                    mbedtls_debug_set_threshold( 0 );
-                    mbedtls_net_init( &m_server_fd );
-                    mbedtls_ssl_init( &m_ssl );
-                    mbedtls_ssl_config_init( &m_conf );
-                    mbedtls_x509_crt_init( &m_cacert );
-                    mbedtls_ctr_drbg_init( &m_ctr_drbg );
-
-                    std::cout <<  "Seeding the random number generator... " << __LINE__ << std::endl;
-
-                    mbedtls_entropy_init( &m_entropy );
-                    int ret = 0;
-                    if( ( ret = mbedtls_ctr_drbg_seed( &m_ctr_drbg, mbedtls_entropy_func, &m_entropy,
-                                                       (const unsigned char *) pers,
-                                                       strlen( pers ) ) ) != 0 )
-                    {
-                        std::cout <<  " failed  ! mbedtls_ctr_drbg_seed returned " << ret  << " " << __LINE__ << std::endl;
-                        return handler(error::make_error_code(error::value::mbedtls_ctr_drbg_seed_fail));
-                    }
-                    std::cout << "init " << __LINE__ << std::endl;
                     handler(error::make_error_code(error::value::success));
                 }
 
                 lib::error_code init_mbedtls() {
-                    mbedtls_debug_set_threshold( 0 );
-                    mbedtls_net_init( &m_server_fd );
-                    mbedtls_ssl_init( &m_ssl );
-                    mbedtls_ssl_config_init( &m_conf );
-                    mbedtls_x509_crt_init( &m_cacert );
-                    mbedtls_ctr_drbg_init( &m_ctr_drbg );
+                    /*
+                    * 0. Initialize the RNG and the session data
+                    */
+                    mbedtls_debug_set_threshold(0);
+                    mbedtls_net_init(&m_server_fd);
+                    mbedtls_ssl_init(&m_ssl);
+                    mbedtls_ssl_config_init(&m_conf);
+                    mbedtls_ctr_drbg_init(&m_ctr_drbg);
 
-                    std::cout <<  "Seeding the random number generator... " << __LINE__ << std::endl;
+                    std::cout << "Seeding the random number generator... " << __LINE__ << std::endl;
 
-                    mbedtls_entropy_init( &m_entropy );
+                    mbedtls_entropy_init(&m_entropy);
                     int ret = 0;
-                    if( ( ret = mbedtls_ctr_drbg_seed( &m_ctr_drbg, mbedtls_entropy_func, &m_entropy,
-                                                       (const unsigned char *) pers,
-                                                       strlen( pers ) ) ) != 0 )
-                    {
-                        std::cout <<  " failed  ! mbedtls_ctr_drbg_seed returned " << ret  << " " << __LINE__ << std::endl;
+                    if ((ret = mbedtls_ctr_drbg_seed(&m_ctr_drbg, mbedtls_entropy_func, &m_entropy,
+                                                     (const unsigned char *) pers,
+                                                     strlen(pers))) != 0) {
+                        std::cout << " failed  ! mbedtls_ctr_drbg_seed returned " << ret << " " << __LINE__
+                                  << std::endl;
                         return error::make_error_code(error::value::mbedtls_ctr_drbg_seed_fail);
                     }
                     std::cout << "init " << __LINE__ << std::endl;
                     return error::make_error_code(error::value::success);
                 }
 
+                static void my_debug(void *ctx, int level,
+                                     const char *file, int line,
+                                     const char *str) {
+                    ((void) level);
+
+                    fprintf((FILE *) ctx, "%s:%04d: %s\n", file, line, str);
+                    fflush((FILE *) ctx);
+                }
+
+                lib::error_code async_connect(uri_ptr location) {
+
+                    /*
+                     * 1. Start the connection
+                     */
+                    printf("  . Connecting to tcp/%s/%s...\n", location->get_host().c_str(),
+                           location->get_port_str().c_str());
+                    fflush(stdout);
+
+                    m_is_secure = location->get_secure();
+
+                    int ret = 0;
+                    if ((ret = mbedtls_net_connect(&m_server_fd, location->get_host().c_str(),
+                                                   location->get_port_str().c_str(), MBEDTLS_NET_PROTO_TCP)) != 0) {
+                        printf(" failed\n  ! mbedtls_net_connect returned %d\n\n", ret);
+                        return error::make_error_code(error::value::connect_fail);
+                    }
+
+                    printf("connect ok\n");
+                    if (!is_secure())
+                        return error::make_error_code(error::value::success);
+
+                    /*
+                     * 2. Setup stuff
+                     */
+                    printf("  . Setting up the SSL/TLS structure...\n");
+                    fflush(stdout);
+
+                    if ((ret = mbedtls_ssl_config_defaults(&m_conf,
+                                                           MBEDTLS_SSL_IS_CLIENT,
+                                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+                        printf(" failed\n  ! mbedtls_ssl_config_defaults returned %d\n\n", ret);
+                        return error::make_error_code(error::value::connect_fail);
+                    }
+
+                    printf("set stuff ok\n");
+
+
+                    /* OPTIONAL is not optimal for security,
+                     * but makes interop easier in this simplified example */
+                    mbedtls_ssl_conf_authmode(&m_conf, MBEDTLS_SSL_VERIFY_NONE);
+                    mbedtls_ssl_conf_rng(&m_conf, mbedtls_ctr_drbg_random, &m_ctr_drbg);
+                    mbedtls_ssl_conf_dbg(&m_conf, my_debug, stdout);
+                    mbedtls_ssl_conf_read_timeout(&m_conf, 1000);
+
+                    if ((ret = mbedtls_ssl_setup(&m_ssl, &m_conf)) != 0) {
+                        printf(" failed\n  ! mbedtls_ssl_setup returned %d\n\n", ret);
+                        return error::make_error_code(error::value::connect_fail);
+                    }
+
+                    if ((ret = mbedtls_ssl_set_hostname(&m_ssl, location->get_host().c_str())) != 0) {
+                        printf(" failed\n  ! mbedtls_ssl_set_hostname returned %d\n\n", ret);
+                        return error::make_error_code(error::value::connect_fail);
+                    }
+
+                    mbedtls_ssl_set_bio(&m_ssl, &m_server_fd, mbedtls_net_send, mbedtls_net_recv,
+                                        mbedtls_net_recv_timeout);
+
+                    /*
+                     * 4. Handshake
+                     */
+                    printf("  . Performing the SSL/TLS handshake...\n");
+                    fflush(stdout);
+
+                    while ((ret = mbedtls_ssl_handshake(&m_ssl)) != 0) {
+                        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                            printf(" failed\n  ! mbedtls_ssl_handshake returned -0x%x\n\n", (unsigned int) -ret);
+                            return error::make_error_code(error::value::connect_fail);
+                        }
+                    }
+
+                    printf("handshake ok\n");
+
+                    /*
+                     * 5. Verify the server certificate
+                     */
+                    printf("  . Verifying peer X.509 certificate...\n");
+
+                    /* In real life, we probably want to bail out when ret != 0 */
+//                    if ((m_flags = mbedtls_ssl_get_verify_result(&m_ssl)) != 0) {
+//#if !defined(MBEDTLS_X509_REMOVE_INFO)
+//                        char vrfy_buf[512];
+//#endif
+//
+//                        printf(" failed\n");
+//
+//#if !defined(MBEDTLS_X509_REMOVE_INFO)
+//                        mbedtls_x509_crt_verify_info(vrfy_buf, sizeof(vrfy_buf), "  ! ", m_flags);
+//
+//                        printf("%s\n", vrfy_buf);
+//#endif
+//                    } else
+                    printf("verify the server certificate ok\n");
+                    return error::make_error_code(error::value::success);
+                }
+
                 void async_read_at_least(size_t num_bytes, char *buf, size_t len,
                                          read_handler handler) {
+                    th->async([=] { sync_read_at_least(num_bytes, buf, len, handler); });
+                }
+
+                void sync_read_at_least(size_t num_bytes, char *buf, size_t len,
+                                        read_handler handler) {
                     std::cout << "async_read_at_least" << " " << __LINE__ << std::endl;
+                    /*
+                    * 7. Read the HTTP response
+                    */
+                    printf("  < Read from server: least %d\n", num_bytes);
+                    fflush(stdout);
+
+                    int ret = 0, st = 0;
+                    memset(buf, 0, len);
+                    int i = 0;
+                    do {
+                        if (is_secure())
+                            ret = mbedtls_ssl_read(&m_ssl, reinterpret_cast<unsigned char *>(buf + st), len - st);
+                        else
+                            ret = mbedtls_net_recv_timeout(&m_server_fd, reinterpret_cast<unsigned char *>(buf + st),
+                                                           len - st, 1000);
+                        printf("%x\n", ret);
+
+//                        if (is_secure())
+                        {
+                            if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+                                continue;
+
+                            if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+                                return handler(error::make_error_code(error::success), st);
+                            }
+                        }
+
+                        if (ret < 0) {
+                            printf("failed\n  ! mbedtls_ssl_read returned -%x\n\n", -ret);
+                            if (ret != MBEDTLS_ERR_SSL_TIMEOUT)
+                                return handler(error::make_error_code(error::async_read_fail), st);
+                            break;
+                        }
+
+                        if (ret == 0) {
+                            return handler(transport::error::eof, 0);
+                        }
+                        st += ret;
+                    } while (st < len && st < num_bytes);
+                    printf(" %d bytes read\n", st);
+                    handler(error::make_error_code(error::success), st);
                 }
 
                 void async_write(const char *buf, size_t len, write_handler handler) {
+
+                    th->async([=, data = std::string(buf, len)] { sync_write(data, handler); });
+                }
+
+                void sync_write(std::string data, write_handler handler) {
                     std::cout << "async_write" << " " << __LINE__ << std::endl;
+                    /*
+                    * 3. Write the GET request
+                    */
+                    printf("  > Write to server:\n");
+                    fflush(stdout);
+
+                    int ret = 0, st = 0, len = data.size();
+                    std::cout << "send len " << len << std::endl;
+                    if (st < len)
+                        do {
+
+                            if (is_secure() ? (ret = mbedtls_ssl_write(&m_ssl,
+                                                                       reinterpret_cast<const unsigned char *>(data.data() +
+                                                                                                               st),
+                                                                       len - st)) :
+                                (ret = mbedtls_net_send(&m_server_fd, reinterpret_cast<const unsigned char *>(data.data() + st),
+                                                        len - st)) <= 0) {
+                                if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                                    printf(" failed\n  ! mbedtls_ssl_write returned %d\n\n", ret);
+                                    return handler(error::make_error_code(error::value::async_write_fail));
+                                }
+                            } else
+                                st += ret;
+                        } while (st < len);
+
+                    printf(" %d bytes written\n", st);
+                    handler(error::make_error_code(error::value::success));
                 }
 
-                void async_write(std::vector<buffer> &bufs, write_handler handler) {
+                void sync_write(std::vector<buffer> &bufs, write_handler handler) {
+                    th->async([=] { sync_write(bufs, handler); });
+                }
+
+                void async_write(std::vector<buffer> bufs, write_handler handler) {
                     std::cout << "async_write_vector" << " " << __LINE__ << std::endl;
-
+                    lib::error_code ret;
+                    for (const auto &buf: bufs) {
+                        std::cout << "will send len " << buf.len << std::endl;
+                        sync_write(std::string(buf.buf, buf.len), [&ret](lib::error_code ec) { ret = ec; });
+                        if (ret) {
+                            printf("send error! %s", ret.message().c_str());
+                            return handler(ret);
+                        }
+                    }
+                    handler(error::make_error_code(error::value::success));
                 }
-
 
                 void set_handle(connection_hdl hdl) {
                     std::cout << "set_handle" << " " << __LINE__ << std::endl;
@@ -185,16 +380,37 @@ namespace websocketpp {
 
                 bool is_secure() const {
                     std::cout << "is_secure" << " " << __LINE__ << std::endl;
-                    return false;
+                    return m_is_secure;
                 }
 
                 lib::error_code dispatch(dispatch_handler handler) {
                     std::cout << "dispatch" << " " << __LINE__ << std::endl;
-                    return lib::error_code();
+                    handler();
+                    return error::make_error_code(error::value::success);
                 }
 
                 void async_shutdown(shutdown_handler handler) {
                     std::cout << "async_shutdown" << " " << __LINE__ << std::endl;
+
+                    mbedtls_ssl_close_notify(&m_ssl);
+
+                    int exit_code = MBEDTLS_EXIT_SUCCESS;
+                    int ret = 0;
+#ifdef MBEDTLS_ERROR_C
+                    if (exit_code != MBEDTLS_EXIT_SUCCESS) {
+                        char error_buf[100];
+                        mbedtls_strerror(ret, error_buf, 100);
+                        mbedtls_printf("Last error was: %d - %s\n\n", ret, error_buf);
+                    }
+#endif
+
+                    mbedtls_net_free(&m_server_fd);
+
+                    mbedtls_ssl_free(&m_ssl);
+                    mbedtls_ssl_config_free(&m_conf);
+                    mbedtls_ctr_drbg_free(&m_ctr_drbg);
+                    mbedtls_entropy_free(&m_entropy);
+
                 }
 
                 /// Get a shared pointer to this component
@@ -202,10 +418,11 @@ namespace websocketpp {
                     return type::shared_from_this();
                 }
 
-            private:
+            public:
                 bool m_is_server;
                 lib::shared_ptr<alog_type> m_alog;
                 lib::shared_ptr<elog_type> m_elog;
+                bool m_is_secure;
 
                 connection_hdl m_connection_hdl;
 
@@ -218,8 +435,8 @@ namespace websocketpp {
                 mbedtls_ctr_drbg_context m_ctr_drbg;
                 mbedtls_ssl_context m_ssl;
                 mbedtls_ssl_config m_conf;
-                mbedtls_x509_crt m_cacert;
 
+                std::shared_ptr<Threading> th;
             };
 
             template<typename config>
@@ -238,19 +455,19 @@ namespace websocketpp {
 
                 lib::error_code init(transport_con_ptr tcon) {
                     std::cout << "init" << " " << __LINE__ << std::endl;
-                    m_is_secure = tcon->is_secure();
                     return lib::error_code();
                 }
 
                 bool is_secure() const {
                     std::cout << "is_secure" << " " << __LINE__ << std::endl;
-                    return m_is_secure;
+                    return true;
                 }
 
                 void async_connect(transport_con_ptr tcon, uri_ptr location,
                                    connect_handler handler) {
                     std::cout << "async_connect" << " " << __LINE__ << std::endl;
-
+                    m_is_secure = location->get_secure();
+                    handler(tcon->async_connect(location));
                 }
 
                 void init_logging(const lib::shared_ptr<alog_type> &a, const lib::shared_ptr<elog_type> &e) {
@@ -258,6 +475,7 @@ namespace websocketpp {
                     m_alog = a;
                     m_elog = e;
                 }
+
             private:
                 lib::shared_ptr<alog_type> m_alog;
                 lib::shared_ptr<elog_type> m_elog;
@@ -331,7 +549,7 @@ namespace brls {
 namespace bilibili {
 
     namespace Api {
-        static std::string LiveChatUrl = "ws://broadcastlv.chat.bilibili.com:2244/sub";
+        static std::string LiveChatUrl = "wss://broadcastlv.chat.bilibili.com:2245/sub";
     }
 
     typedef websocketpp::client<websocketpp::config::test_client> client;
@@ -391,7 +609,7 @@ namespace bilibili {
         ~LiveChat();
 
     private:
-        void HeartTimeout(const websocketpp::lib::error_code &ec);
+        void HeartTimeout();
 
         void on_open(websocketpp::connection_hdl hdl);
 
@@ -405,6 +623,7 @@ namespace bilibili {
         int roomid;
         livechat_callback_func callback;
         client c;
+        client::connection_ptr con;
         websocketpp::connection_hdl hdl;
         // std::shared_ptr<asio::high_resolution_timer> t;
         std::shared_ptr<std::thread> th;
@@ -449,7 +668,7 @@ namespace bilibili {
                 break;
             }
             if (header.op == LiveChatOpcode::WS_OP_CONNECT_SUCCESS) {
-                HeartTimeout(websocketpp::lib::error_code());
+                HeartTimeout();
             } else if (header.op == LiveChatOpcode::WS_OP_MESSAGE) {
                 if (header.ver == LiveChatVer::WS_BODY_PROTOCOL_VERSION_DEFLATE) {
                     static char in[DATA_SIZE_MAX];
@@ -491,6 +710,7 @@ namespace bilibili {
     }
 
     void LiveChat::on_open(websocketpp::connection_hdl hdl) {
+        brls::Logger::info("on open!!!");
         websocketpp::lib::error_code ec;
         std::string j("{\"uid\": 1,\"roomid\": " + std::to_string(roomid) +
                       ",\"protover\": 1,\"platform\": "
@@ -503,29 +723,17 @@ namespace bilibili {
     }
 
     //定时器回调函数
-    void LiveChat::HeartTimeout(const websocketpp::lib::error_code &ec) {
-        if (ec) {
-            brls::Logger::error("timer is cancel " + ec.message());
-            return;
-        }
+    void LiveChat::HeartTimeout() {
         brls::Logger::info("HeartTimeout");
 
-        websocketpp::lib::error_code ecc;
+        websocketpp::lib::error_code ec;
         c.send(hdl, get_msg("", LiveChatOpcode::WS_OP_HEARTBEAT),
-               websocketpp::frame::opcode::value::binary, ecc);
-        if (ecc) {
+               websocketpp::frame::opcode::value::binary, ec);
+        if (ec) {
             brls::Logger::error("could not create connection because: " +
                                 ec.message());
         }
-        // if (!t)
-        // {
-        //     t = std::make_shared<asio::high_resolution_timer>(
-        //         c.get_io_service(), std::chrono::seconds(0));
-        // }
-        // t->expires_at(t->expires_at() +
-        //               std::chrono::seconds(HEART_TIMER_SEC));
-        // t->async_wait([this](const websocketpp::lib::error_code &err)
-        //               { this->HeartTimeout(err); });
+        con->th->delay(30*1000, [=]{ HeartTimeout();});
     }
 
     int LiveChat::start(int roomid, livechat_callback_func callback) {
@@ -542,7 +750,10 @@ namespace bilibili {
 
             // Register our message handler
             c.set_message_handler(
-                    [this](auto h, auto m) { return this->on_message(h, m); });
+                    [this](auto h, auto m) {
+                        printf("start on message\n");
+                        return this->on_message(h, m);
+                    });
             c.set_open_handler([this](auto h) { return this->on_open(h); });
             // c.set_tls_init_handler([](websocketpp::connection_hdl)
             //                        { return websocketpp::lib::make_shared<asio::ssl::context>(
@@ -556,7 +767,7 @@ namespace bilibili {
 //                    return websocketpp::lib::error_code();
 //                });
             websocketpp::lib::error_code ec;
-            client::connection_ptr con = c.get_connection(Api::LiveChatUrl, ec);
+            con = c.get_connection(Api::LiveChatUrl, ec);
             if (ec) {
                 brls::Logger::error(
                         "LiveChat could not create connection because: " +
@@ -564,13 +775,13 @@ namespace bilibili {
                 return -1;
             }
             hdl = con->get_handle();
+            con->init_mbedtls();
 
-            c.connect(con);
-            con->start();
-            HeartTimeout(ec);
-
-            // th = std::make_shared<std::thread>([this]
-            //                                    { c.run(); });
+            th = std::make_shared<std::thread>([this, con = std::move(con)] {
+                c.connect(con);
+//                con->th.stop();
+                printf("---------------------------------------");
+            });
         }
         catch (websocketpp::exception const &e) {
             brls::Logger::error("LiveChat start error, roomid " +
@@ -581,13 +792,16 @@ namespace bilibili {
     }
 
     LiveChat::~LiveChat() {
-        // if (t)
-        //     t->cancel();
-        callback = nullptr;
-        c.close(hdl, 0, "");
-        if (th)
-            th->join();
-        std::cout << "finised!!!!!" << std::endl;
+        try {
+            // if (t)
+            //     t->cancel();
+            c.close(hdl, websocketpp::close::status::normal, "");
+            if (th->joinable())
+                th->join();
+            callback = nullptr;
+        } catch (std::exception &e) {
+            std::cout << "exception: " << e.what() << std::endl;
+        }
     }
 
 }; // namespace bilibili
@@ -596,7 +810,7 @@ int main() {
     // std::cin >> bilibili::Api::LiveChatUrl;
     try {
         bilibili::LiveChat l;
-        l.start(7685334,
+        l.start(41515,
                 [](std::string s) { std::cout << ">| " << std::to_string(s.size() + 16) << " " << s << std::endl; });
         char c = '\0';
         while (scanf("%c", &c) != EOF && c != 'c');
