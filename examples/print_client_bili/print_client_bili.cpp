@@ -260,12 +260,13 @@ namespace websocketpp {
 
                 void async_read_at_least(size_t num_bytes, char *buf, size_t len,
                                          read_handler handler) {
-                    th->async([=] { sync_read_at_least(num_bytes, buf, len, handler); });
+                    std::cout << "async_read_at_least" << " " << __LINE__ << " " << pthread_self() << std::endl;
+                    th->sync([=] { th->async([=] { sync_read_at_least(num_bytes, buf, len, handler); }); });
                 }
 
                 void sync_read_at_least(size_t num_bytes, char *buf, size_t len,
                                         read_handler handler) {
-                    std::cout << "async_read_at_least" << " " << __LINE__ << std::endl;
+                    std::cout << "sync_read_at_least" << " " << __LINE__ << " " << pthread_self() << std::endl;
                     /*
                     * 7. Read the HTTP response
                     */
@@ -276,9 +277,10 @@ namespace websocketpp {
                     memset(buf, 0, len);
                     int i = 0;
                     do {
-                        if (is_secure())
+                        if (is_secure()) {
                             ret = mbedtls_ssl_read(&m_ssl, reinterpret_cast<unsigned char *>(buf + st), len - st);
-                        else
+
+                        } else
                             ret = mbedtls_net_recv_timeout(&m_server_fd, reinterpret_cast<unsigned char *>(buf + st),
                                                            len - st, 1000);
                         printf("%x\n", ret);
@@ -310,28 +312,23 @@ namespace websocketpp {
                 }
 
                 void async_write(const char *buf, size_t len, write_handler handler) {
-
-                    th->async([=, data = std::string(buf, len)] { sync_write(data, handler); });
-                }
-
-                void sync_write(std::string data, write_handler handler) {
-                    std::cout << "async_write" << " " << __LINE__ << std::endl;
+                    std::cout << "sync_write" << " " << __LINE__ << " " << pthread_self() << std::endl;
                     /*
                     * 3. Write the GET request
                     */
                     printf("  > Write to server:\n");
                     fflush(stdout);
 
-                    int ret = 0, st = 0, len = data.size();
+                    int ret = 0, st = 0;
                     std::cout << "send len " << len << std::endl;
                     if (st < len)
                         do {
 
                             if (is_secure() ? (ret = mbedtls_ssl_write(&m_ssl,
-                                                                       reinterpret_cast<const unsigned char *>(data.data() +
+                                                                       reinterpret_cast<const unsigned char *>(buf +
                                                                                                                st),
-                                                                       len - st)) :
-                                (ret = mbedtls_net_send(&m_server_fd, reinterpret_cast<const unsigned char *>(data.data() + st),
+                                                                       len - st)) <= 0 :
+                                (ret = mbedtls_net_send(&m_server_fd, reinterpret_cast<const unsigned char *>(buf + st),
                                                         len - st)) <= 0) {
                                 if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
                                     printf(" failed\n  ! mbedtls_ssl_write returned %d\n\n", ret);
@@ -345,16 +342,12 @@ namespace websocketpp {
                     handler(error::make_error_code(error::value::success));
                 }
 
-                void sync_write(std::vector<buffer> &bufs, write_handler handler) {
-                    th->async([=] { sync_write(bufs, handler); });
-                }
-
                 void async_write(std::vector<buffer> bufs, write_handler handler) {
                     std::cout << "async_write_vector" << " " << __LINE__ << std::endl;
                     lib::error_code ret;
                     for (const auto &buf: bufs) {
                         std::cout << "will send len " << buf.len << std::endl;
-                        sync_write(std::string(buf.buf, buf.len), [&ret](lib::error_code ec) { ret = ec; });
+                        async_write(buf.buf, buf.len, [&ret](lib::error_code ec) { ret = ec; });
                         if (ret) {
                             printf("send error! %s", ret.message().c_str());
                             return handler(ret);
@@ -379,7 +372,7 @@ namespace websocketpp {
                 }
 
                 bool is_secure() const {
-                    std::cout << "is_secure" << " " << __LINE__ << std::endl;
+                    std::cout << "is_secure" << " " << __LINE__ << "  " << m_is_secure << std::endl;
                     return m_is_secure;
                 }
 
@@ -549,7 +542,7 @@ namespace brls {
 namespace bilibili {
 
     namespace Api {
-        static std::string LiveChatUrl = "wss://broadcastlv.chat.bilibili.com:2245/sub";
+        static std::string LiveChatUrl = "ws://broadcastlv.chat.bilibili.com:2244/sub";
     }
 
     typedef websocketpp::client<websocketpp::config::test_client> client;
@@ -627,6 +620,7 @@ namespace bilibili {
         websocketpp::connection_hdl hdl;
         // std::shared_ptr<asio::high_resolution_timer> t;
         std::shared_ptr<std::thread> th;
+        std::shared_ptr<Threading> heartTimer;
     };
 
 } // namespace bilibili
@@ -733,17 +727,19 @@ namespace bilibili {
             brls::Logger::error("could not create connection because: " +
                                 ec.message());
         }
-        con->th->delay(30*1000, [=]{ HeartTimeout();});
+        heartTimer->sync([this] { heartTimer->delay(30 * 1000, [this] { HeartTimeout(); }); });
+//        con->th->delay(30*1000, std::bind(&LiveChat::HeartTimeout, this));
     }
 
     int LiveChat::start(int roomid, livechat_callback_func callback) {
         if (sizeof(WsHeader) != 0x10)
             return -1;
         try {
+            heartTimer = std::make_shared<Threading>();
             this->roomid = roomid;
             this->callback = callback;
             c.set_access_channels(websocketpp::log::alevel::devel);
-//            c.clear_access_channels(websocketpp::log::alevel::all);
+            c.clear_access_channels(websocketpp::log::alevel::all);
             c.set_error_channels(websocketpp::log::elevel::devel);
 
             // c.init_asio();
@@ -768,6 +764,7 @@ namespace bilibili {
 //                });
             websocketpp::lib::error_code ec;
             con = c.get_connection(Api::LiveChatUrl, ec);
+            std::cout << "get_connection " << __LINE__ << std::endl;
             if (ec) {
                 brls::Logger::error(
                         "LiveChat could not create connection because: " +
@@ -777,9 +774,9 @@ namespace bilibili {
             hdl = con->get_handle();
             con->init_mbedtls();
 
-            th = std::make_shared<std::thread>([this, con = std::move(con)] {
+            th = std::make_shared<std::thread>([this] {
+
                 c.connect(con);
-//                con->th.stop();
                 printf("---------------------------------------");
             });
         }
@@ -793,6 +790,7 @@ namespace bilibili {
 
     LiveChat::~LiveChat() {
         try {
+
             // if (t)
             //     t->cancel();
             c.close(hdl, websocketpp::close::status::normal, "");
@@ -810,9 +808,10 @@ int main() {
     // std::cin >> bilibili::Api::LiveChatUrl;
     try {
         bilibili::LiveChat l;
-        l.start(41515,
+        l.start(25836285,
                 [](std::string s) { std::cout << ">| " << std::to_string(s.size() + 16) << " " << s << std::endl; });
-        char c = '\0';
+
+        char c = 'a';
         while (scanf("%c", &c) != EOF && c != 'c');
     }
     catch (websocketpp::exception &e) {
