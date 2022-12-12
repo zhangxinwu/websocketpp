@@ -117,7 +117,7 @@ namespace websocketpp {
 
                 explicit connection(bool is_server, const lib::shared_ptr<alog_type> &alog,
                                     const lib::shared_ptr<elog_type> &elog) : m_is_server(is_server), m_alog(alog),
-                                                                              m_elog(elog), th(std::make_shared<Threading>()) {
+                                                                              m_elog(elog) {
                     std::cout << "connection" << " " << __LINE__ << std::endl;
                     m_alog->write(log::alevel::devel, "iostream con transport constructor");
                 }
@@ -258,13 +258,13 @@ namespace websocketpp {
                     return error::make_error_code(error::value::success);
                 }
 
-                void async_read_at_least(size_t num_bytes, char *buf, size_t len,
+                void sync_read_at_least(size_t num_bytes, char *buf, size_t len,
                                          read_handler handler) {
                     std::cout << "async_read_at_least" << " " << __LINE__ << " " << pthread_self() << std::endl;
-                    th->sync([=] { th->async([=] { sync_read_at_least(num_bytes, buf, len, handler); }); });
+//                    th->sync([=] { th->async([=] { sync_read_at_least(num_bytes, buf, len, handler); }); });
                 }
 
-                void sync_read_at_least(size_t num_bytes, char *buf, size_t len,
+                void async_read_at_least(size_t num_bytes, char *buf, size_t len,
                                         read_handler handler) {
                     std::cout << "sync_read_at_least" << " " << __LINE__ << " " << pthread_self() << std::endl;
                     /*
@@ -403,7 +403,11 @@ namespace websocketpp {
                     mbedtls_ssl_config_free(&m_conf);
                     mbedtls_ctr_drbg_free(&m_ctr_drbg);
                     mbedtls_entropy_free(&m_entropy);
+                    if(m_shutdown_handler) m_shutdown_handler();
+                }
 
+                void set_shutdown_handler(const std::function<void()>& handler) {
+                    m_shutdown_handler = handler;
                 }
 
                 /// Get a shared pointer to this component
@@ -429,7 +433,7 @@ namespace websocketpp {
                 mbedtls_ssl_context m_ssl;
                 mbedtls_ssl_config m_conf;
 
-                std::shared_ptr<Threading> th;
+                std::function<void()> m_shutdown_handler;
             };
 
             template<typename config>
@@ -771,6 +775,8 @@ namespace bilibili {
                         ec.message());
                 return -1;
             }
+            con->set_shutdown_handler([this]{heartTimer->stop();});
+
             hdl = con->get_handle();
             con->init_mbedtls();
 
@@ -790,9 +796,7 @@ namespace bilibili {
 
     LiveChat::~LiveChat() {
         try {
-
-            // if (t)
-            //     t->cancel();
+            heartTimer->stop();
             c.close(hdl, websocketpp::close::status::normal, "");
             if (th->joinable())
                 th->join();
